@@ -1,0 +1,6 @@
+flask
+groq
+scikit-learn
+numpy
+pypdf
+gunicorn

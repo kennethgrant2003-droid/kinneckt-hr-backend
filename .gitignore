@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+kb_index.pkl
+*.log
+.vscode/
+.idea/
