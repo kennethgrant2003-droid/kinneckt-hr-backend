@@ -27,7 +27,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_PATH = BASE_DIR / "kb_index.pkl"
 
-GROQ_MODEL = "gpt-4o-mini"   # Change if needed
+GROQ_MODEL = "GROQ_MODEL = "openai/gpt-oss-20b"
+"   # Change if needed
 
 
 # ============================================================
