@@ -1,6 +1,11 @@
 """
-Kinneckt HR Assistant - Full Production Backend
-Groq + Retrieval + Mediation Mode + Memory + Roles + Admin + Saving Conversations
+Kinneckt HR Assistant Backend (Flask)
+- Groq LLM + Retrieval (KB) + Session Memory
+- Mobile endpoint: POST /api/chat
+- Web UI: GET /
+- Admin dashboard: GET /admin
+- Health check: GET /health
+- Creator attribution: answers "who created this app" etc.
 """
 
 import os
@@ -9,53 +14,67 @@ import pickle
 from datetime import datetime
 from pathlib import Path
 
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    render_template_string,
-)
+from flask import Flask, request, jsonify, render_template_string
 
+# --- Optional CORS (recommended for mobile) ---
+try:
+    from flask_cors import CORS
+    CORS_AVAILABLE = True
+except Exception:
+    CORS_AVAILABLE = False
+
+# --- Groq + retrieval ---
 from groq import Groq
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-# ============================================================
-#                   CONFIGURATION
-# ============================================================
-
+# =========================
+# CONFIG
+# =========================
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_PATH = BASE_DIR / "kb_index.pkl"
 
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
+app = Flask(__name__)
 
+if CORS_AVAILABLE:
+    # Allow calls from anywhere (fine for MVP).
+    # For production, restrict to your domains.
+    CORS(app)
 
-# ============================================================
-#                   FLASK APP + STATIC
-# ============================================================
-
-app = Flask(__name__, static_folder="static")
-
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Groq client (only if key exists)
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+if client:
+    print("[LLM] Groq client initialized.")
+else:
+    print("[LLM] WARNING: GROQ_API_KEY missing. /api/chat will return an error.")
 
 kb_index = None
-sessions = {}  # session_id → dict
+
+# In-memory sessions
+# sessions[session_id] = {
+#   "company_id": str,
+#   "role": str,
+#   "history": [{"role": "user"/"assistant", "content": str}],
+#   "created_at": datetime
+# }
+sessions: dict[str, dict] = {}
 
 
-# ============================================================
-#                KNOWLEDGE BASE RETRIEVAL
-# ============================================================
-
+# =========================
+# KB LOAD + SEARCH
+# =========================
 def load_kb():
     global kb_index
     if INDEX_PATH.exists():
         with open(INDEX_PATH, "rb") as f:
             kb_index = pickle.load(f)
-        print(f"[KB] Loaded KB from {INDEX_PATH}")
+        print(f"[KB] Loaded knowledge base from {INDEX_PATH}")
     else:
-        print(f"[KB] WARNING: KB not found at {INDEX_PATH}")
         kb_index = None
+        print(f"[KB] WARNING: {INDEX_PATH} not found. Run: python build_hr_kb.py")
 
 
 def search_kb(query: str, top_k: int = 3):
@@ -68,33 +87,33 @@ def search_kb(query: str, top_k: int = 3):
 
     q_vec = vectorizer.transform([query])
     sims = cosine_similarity(q_vec, matrix)[0]
-
-    top_idx = sims.argsort()[::-1][:top_k]
+    top_indices = sims.argsort()[::-1][:top_k]
 
     results = []
-    for i in top_idx:
-        c = chunks[int(i)]
-        results.append({
-            "source": c["source"],
-            "page": c["page"],
-            "text": c["text"],
-            "score": float(sims[int(i)])
-        })
+    for idx in top_indices:
+        c = chunks[int(idx)]
+        results.append(
+            {
+                "source": c.get("source", "unknown"),
+                "page": c.get("page", "?"),
+                "text": c.get("text", ""),
+                "score": float(sims[int(idx)]),
+            }
+        )
     return results
 
 
-# ============================================================
-#                 SESSION MANAGEMENT
-# ============================================================
-
-def get_or_create_session(session_id, company_id, role):
+# =========================
+# SESSION
+# =========================
+def get_or_create_session(session_id: str | None, company_id: str | None, role: str | None):
     if not session_id:
         session_id = str(uuid.uuid4())
 
     if session_id not in sessions:
         sessions[session_id] = {
-            "company_id": company_id,
-            "role": role,
+            "company_id": company_id or "default",
+            "role": role or "unknown",
             "history": [],
             "created_at": datetime.utcnow(),
         }
@@ -107,255 +126,271 @@ def get_or_create_session(session_id, company_id, role):
     return session_id, sessions[session_id]
 
 
-# ============================================================
-#                    ROLE BEHAVIOR
-# ============================================================
+# =========================
+# CREATOR ATTRIBUTION
+# =========================
+def is_creator_question(text: str) -> bool:
+    t = (text or "").strip().lower()
+    triggers = [
+        "who created", "who built", "who made", "who developed",
+        "who is the developer", "who is the creator", "who designed",
+        "who owns this app", "who owns kinneckt", "who made kinneckt",
+        "who built kinneckt", "created by", "built by", "developer name",
+        "who is kenneth", "who is kenneth grant", "who is granted solutions",
+    ]
+    return any(p in t for p in triggers)
 
+def creator_reply() -> str:
+    return (
+        "Kinneckt was created by Kenneth Grant, Founder of Granted Solutions.\n\n"
+        "Kinneckt provides confidential, AI-powered HR guidance for employees, managers, and HR teams—"
+        "focused on clarity, communication, and practical next steps."
+    )
+
+
+# =========================
+# ROLE + MODE INSTRUCTIONS
+# =========================
 def build_role_instructions(role: str) -> str:
     role = (role or "").lower()
-
-    if role == "hr":
+    if role in ("hr", "people ops", "people_ops", "people"):
         return (
-            "The user is in HR / People Ops. Provide structure, documentation, scripts, "
-            "and compliance-aware guidance."
+            "The user is in HR / People Ops / Leadership. "
+            "Prioritize structure, documentation, scripts, action plans, and follow-up steps."
         )
-    if role == "manager":
+    if role in ("manager", "leader", "supervisor"):
         return (
-            "The user is a manager. Help them structure conversations, coach employees, "
-            "and prevent escalation."
+            "The user is a manager or team lead. "
+            "Help them structure conversations, ask good questions, and prevent escalation."
         )
-    if role == "employee":
+    if role in ("employee", "individual contributor", "staff"):
         return (
-            "The user is an employee. Help them explain their situation neutrally, "
-            "identify impact, and communicate professionally."
+            "The user is an employee. Help them describe what’s happening neutrally, "
+            "explain impact, and ask for support."
         )
-
-    return "Ask the user whether they are HR, a manager, or an employee."
+    return (
+        "The user’s role is not clear. Ask if they are HR, manager, or employee and adapt accordingly."
+    )
 
 
 def build_mode_instructions(mode: str) -> str:
-    if (mode or "").lower() == "mediation":
-        return """
-For MEDIATION MODE:
-You MUST output the response EXACTLY in this structure:
-
-1. Risk & Role Notes
-2. Neutral Situation Summary
-3. Key Issues Identified
-4. Mediation Meeting Agenda
-5. Suggested Scripts for the Mediator
-6. Suggested Agreements
-7. Follow-Up Plan
-8. HR Documentation Summary
-
-Each section must contain helpful, detailed, copy-paste-ready guidance.
-Do NOT skip or reorder sections.
-"""
-    return "Respond normally in chat mode."
+    mode = (mode or "chat").lower()
+    if mode == "mediation":
+        return (
+            "The user requested a structured mediation plan. "
+            "Use this exact structure:\n"
+            "1. Risk & Role Notes\n"
+            "2. Neutral Situation Summary\n"
+            "3. Key Issues Identified\n"
+            "4. Mediation Meeting Agenda\n"
+            "5. Suggested Scripts for the Mediator\n"
+            "6. Suggested Agreements\n"
+            "7. Follow-Up Plan\n"
+            "8. HR Documentation Summary (if appropriate)\n"
+            "Make it detailed and copy-paste friendly."
+        )
+    return "Normal chat mode."
 
 
-# ============================================================
-#                 AI GENERATION FUNCTION
-# ============================================================
+# =========================
+# GROQ RESPONSE
+# =========================
+def generate_chat_reply(
+    user_message: str,
+    role: str,
+    company_id: str,
+    kb_snippets: list[dict],
+    history: list[dict],
+    mode: str = "chat",
+) -> str:
 
-def generate_chat_reply(user_message, role, company_id, kb_snippets, history, mode):
+    if not client:
+        return "Server is missing GROQ_API_KEY. Add it in Render Environment Variables and redeploy."
 
     role_instructions = build_role_instructions(role)
     mode_instructions = build_mode_instructions(mode)
 
-    # Build KB context text
-    context = "\n\n".join(
-        [
-            f"From {s['source']} (page {s['page']}): {s['text']}"
-            for s in kb_snippets
-        ]
-    ) or "No HR reference snippets found."
-
-    # Build conversation memory
-    past_turns = []
-    for h in history[-6:]:
-        past_turns.append({"role": h["role"], "content": h["content"]})
+    context_parts = []
+    for snip in kb_snippets[:3]:
+        context_parts.append(
+            f"From {snip.get('source','unknown')} (page {snip.get('page','?')}): {snip.get('text','')}"
+        )
+    context_text = "\n\n".join(context_parts) if context_parts else "No HR snippets retrieved."
 
     system_prompt = f"""
-You are Kinneckt, an HR Assistant Chatbot.
+You are Kinneckt, an HR Assistant.
 
-Tone:
-- Warm, empathetic, neutral.
-- No legal advice.
-- No blame.
-- Focus on behavior, communication, impact, and next steps.
+You do NOT give legal advice.
+You do NOT decide who is right or wrong.
+You focus on clarity, behavior, communication, and next steps.
 
-Role instructions:
+Safety:
+If user describes harassment, discrimination, threats, violence, self-harm, stalking,
+or protected class concerns, advise escalation to HR/legal/emergency services as appropriate,
+and remind: "This is not legal advice."
+
+Role behavior:
 {role_instructions}
 
 Mode instructions:
 {mode_instructions}
 
-Safety:
-If the user mentions harassment, discrimination, violence, threats, or self-harm:
-- Recommend escalation.
-- Provide documentation guidance.
-- State “This is not legal advice.”
-
+Style:
+Warm, calm, neutral, professional, high EQ.
+Use short headers and clear bullets.
 """
 
     user_content = f"""
+Company (context only): {company_id}
+
 User message:
 \"\"\"{user_message}\"\"\"
 
-Company: {company_id}
-
-Relevant HR snippets:
-{context}
-
-Follow all structure rules if mediation mode is active.
+HR reference snippets:
+{context_text}
 """
 
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(past_turns)
+
+    for m in history[-6:]:
+        if m.get("role") in ("user", "assistant"):
+            messages.append({"role": m["role"], "content": m["content"]})
+
     messages.append({"role": "user", "content": user_content})
 
-    result = client.chat.completions.create(
+    chat_completion = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
         temperature=0.4,
     )
+    return chat_completion.choices[0].message.content
 
-    return result.choices[0].message.content
 
-
-# ============================================================
-#                 FRONTEND HTML (Kinneckt UI)
-# ============================================================
-
+# =========================
+# SIMPLE WEB UI
+# =========================
 PAGE_TEMPLATE = """
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-<title>Kinneckt HR Assistant</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body { background: #0D1117; color: white; font-family: Arial; padding: 20px; }
-.chat-box { background: #111827; padding: 15px; border-radius: 10px; height: 70vh; overflow-y: auto; }
-.msg { padding: 10px; border-radius: 10px; margin: 8px 0; max-width: 70%; }
-.user { background: #10B981; color: black; margin-left: auto; }
-.bot { background: #374151; }
-</style>
-</head>
-
-<body>
-<h2>Kinneckt HR Assistant</h2>
-<img src="/static/kinneckt_logo.png" width="90"/><br><br>
-
-<div class="chat-box" id="chat"></div>
-
-<textarea id="msg" style="width:100%;height:60px;"></textarea><br>
-<button onclick="send('chat')">Send</button>
-<button onclick="send('mediation')">Mediation Plan</button>
+<head><meta charset="utf-8"/><title>Kinneckt HR Assistant</title></head>
+<body style="font-family: Arial; padding: 16px;">
+  <h2>Kinneckt HR Assistant</h2>
+  <p>Use the mobile app for best experience. This page is a simple test UI.</p>
+  <form id="f">
+    <input id="msg" style="width: 70%;" placeholder="Type..." />
+    <button type="submit">Send</button>
+  </form>
+  <pre id="out" style="white-space: pre-wrap; margin-top: 12px;"></pre>
 
 <script>
-const chat = document.getElementById("chat");
-
-function add(sender, text){
-    let div = document.createElement("div");
-    div.className = "msg " + sender;
-    div.innerText = text;
-    chat.appendChild(div);
-    chat.scrollTop = chat.scrollHeight;
-}
-
-add("bot","Hi, I'm the Kinneckt HR Assistant. How can I support you?");
-
-async function send(mode){
-    let text = document.getElementById("msg").value;
-    document.getElementById("msg").value = "";
-    add("user", text);
-
-    let res = await fetch("/api/chat", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ message:text, mode:mode, session_id:"web" })
-    });
-
-    let data = await res.json();
-    add("bot", data.reply);
-}
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg').value;
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message: msg, role:'employee', company_id:'default', mode:'chat'})
+  });
+  const data = await res.json();
+  document.getElementById('out').textContent = data.reply;
+});
 </script>
-
 </body>
 </html>
 """
 
 
-# ============================================================
-#                    ADMIN DASHBOARD
-# ============================================================
-
-@app.route("/admin")
-def admin():
-    rows = ""
-    for sid, s in sessions.items():
-        rows += f"<tr><td>{sid}</td><td>{s['company_id']}</td><td>{s['role']}</td><td>{len(s['history'])}</td></tr>"
-
-    return f"""
-    <h2>Kinneckt Admin Dashboard</h2>
-    <table border=1 cellpadding=5>
-        <tr><th>Session</th><th>Company</th><th>Role</th><th>Messages</th></tr>
-        {rows}
-    </table>
-    """
+# =========================
+# ROUTES
+# =========================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}), 200
 
 
-# ============================================================
-#                    CHAT ENDPOINT
-# ============================================================
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    data = request.get_json(force=True)
-
-    user_message = (data.get("message") or "").strip()
-    session_id = data.get("session_id") or None
-    role = (data.get("role") or "").strip().lower()
-    company_id = (data.get("company_id") or "default").strip()
-    mode = (data.get("mode") or "chat").strip().lower()
-
-    if not user_message:
-        return jsonify({"reply": "Please enter a message."})
-
-    session_id, session = get_or_create_session(session_id, company_id, role)
-
-    kb_snippets = search_kb(user_message)
-
-    reply_text = generate_chat_reply(
-        user_message=user_message,
-        role=role,
-        company_id=company_id,
-        kb_snippets=kb_snippets,
-        history=session["history"],
-        mode=mode,
-    )
-
-    session["history"].append({"role": "user", "content": user_message})
-    session["history"].append({"role": "assistant", "content": reply_text})
-
-    return jsonify({"reply": reply_text, "session_id": session_id})
-
-
-# ============================================================
-#                    HOME ROUTE
-# ============================================================
-
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
     return render_template_string(PAGE_TEMPLATE)
 
 
-# ============================================================
-#                    MAIN LAUNCH
-# ============================================================
+@app.route("/admin", methods=["GET"])
+def admin_dashboard():
+    rows_html = []
+    for sid, sess in sessions.items():
+        role = sess.get("role", "unknown")
+        company_id = sess.get("company_id", "default")
+        created = sess.get("created_at", datetime.utcnow())
+        history = sess.get("history", [])
+        message_count = len(history)
+
+        preview = ""
+        for m in reversed(history):
+            if m.get("role") == "user":
+                preview = (m.get("content", "")[:120]).replace("<", "&lt;").replace(">", "&gt;")
+                break
+
+        rows_html.append(
+            f"<tr><td>{sid}</td><td>{company_id}</td><td>{role}</td>"
+            f"<td>{message_count}</td><td>{created.isoformat()}Z</td><td>{preview}</td></tr>"
+        )
+
+    html = f"""
+    <html><head><title>Kinneckt Admin</title></head>
+    <body style="font-family: Arial; padding: 16px; background:#f3f4f6;">
+      <h2>Kinneckt Admin Dashboard</h2>
+      <table border="1" cellpadding="6" style="background:#fff; border-collapse:collapse; width:100%;">
+        <tr><th>Session</th><th>Company</th><th>Role</th><th>Messages</th><th>Created</th><th>Last user msg</th></tr>
+        {''.join(rows_html)}
+      </table>
+    </body></html>
+    """
+    return html
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception as e:
+        print("[API] JSON parse error:", e)
+        return jsonify({"reply": "I had trouble reading your request JSON."}), 400
+
+    user_message = (data.get("message") or "").strip()
+    session_id = data.get("session_id")
+    role = (data.get("role") or "unknown").strip()
+    company_id = (data.get("company_id") or "default").strip()
+    mode = (data.get("mode") or "chat").strip().lower()
+
+    # ✅ Creator question handled here (no app resubmission needed)
+    if is_creator_question(user_message):
+        return jsonify({"reply": creator_reply()}), 200
+
+    # Create or get session
+    session_id, sess = get_or_create_session(session_id, company_id, role)
+
+    # Store user message in memory
+    sess["history"].append({"role": "user", "content": user_message})
+
+    # Retrieval
+    kb_snips = search_kb(user_message, top_k=3)
+
+    # LLM reply (mediation works if mode == "mediation")
+    reply_text = generate_chat_reply(
+        user_message=user_message,
+        role=sess["role"],
+        company_id=sess["company_id"],
+        kb_snippets=kb_snips,
+        history=sess["history"],
+        mode=mode,
+    )
+
+    # Store assistant message
+    sess["history"].append({"role": "assistant", "content": reply_text})
+
+    return jsonify({"reply": reply_text, "session_id": session_id}), 200
+
 
 if __name__ == "__main__":
     load_kb()
-    print("[INFO] Starting Kinneckt HR Assistant backend...")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+
